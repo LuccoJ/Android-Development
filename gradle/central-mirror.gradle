@@ -1,0 +1,24 @@
+// Local to this container: Maven Central rate-limits the shared IP, so use Google's public mirror of it
+def mirror = "https://maven-central.storage-download.googleapis.com/maven2/"
+def redirect = { RepositoryHandler repos ->
+    repos.withType(MavenArtifactRepository).configureEach { repo ->
+        if (repo.url.toString().startsWith("https://repo.maven.apache.org/maven2")) {
+            repo.url = mirror
+        }
+    }
+}
+def mirrorFirst = { RepositoryHandler repos ->
+    def m = repos.maven { name = "CentralMirror"; url = mirror }
+    repos.remove(m)
+    repos.addFirst(m)
+}
+beforeSettings { settings ->
+    mirrorFirst(settings.buildscript.repositories)
+}
+settingsEvaluated { settings ->
+    mirrorFirst(settings.pluginManagement.repositories)
+    redirect(settings.dependencyResolutionManagement.repositories)
+}
+allprojects {
+    mirrorFirst(buildscript.repositories)
+}
