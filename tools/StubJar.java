@@ -10,7 +10,9 @@ import org.objectweb.asm.tree.*;
 /**
  * Builds an SDK-style android.jar: the public/protected API of an AOSP framework jar plus the
  * java.* / javax.* / org.w3c / org.xml API of the running OpenJDK. Non-public supertypes of kept
- * classes are kept too, since compilers need the full hierarchy.
+ * classes are kept too, since compilers need the full hierarchy. Method bodies are replaced by
+ * {@code throw new RuntimeException("Stub!")}, as in the SDK's android.jar, which AGP's
+ * unit-test support expects.
  * Optionally also writes a framework.aidl declaring the public Parcelable classes, for the AIDL compiler.
  * Usage: StubJar out.jar framework.jar [framework.aidl]
  */
@@ -56,6 +58,7 @@ public class StubJar {
         Map<String, Integer> access = new HashMap<>();
         Map<String, List<String>> supers = new HashMap<>();
         Map<String, List<String>> hierarchy = new HashMap<>();
+        Map<String, String> superNames = new HashMap<>();
         for (Map.Entry<String, byte[]> c : classes.entrySet()) {
             ClassNode cn = new ClassNode();
             new ClassReader(c.getValue()).accept(cn, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
@@ -65,6 +68,10 @@ public class StubJar {
             List<String> s = new ArrayList<>(cn.interfaces);
             if (cn.superName != null) s.add(cn.superName);
             hierarchy.put(cn.name, new ArrayList<>(s));
+            superNames.put(cn.name, cn.superName);
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("<init>")) constructors.computeIfAbsent(cn.name, k -> new ArrayList<>()).add(m);
+            }
             if (cn.outerClass != null) s.add(cn.outerClass);
             int dollar = cn.name.lastIndexOf('$');
             if (dollar > 0) s.add(cn.name.substring(0, dollar));
@@ -85,7 +92,10 @@ public class StubJar {
                 ClassNode cn = new ClassNode();
                 new ClassReader(classes.get(name)).accept(cn, 0);
                 cn.fields.removeIf(f -> !visible(f.access));
-                cn.methods.removeIf(m -> !visible(m.access));
+                // Non-private constructors stay, as stub constructors may call them
+                cn.methods.removeIf(m -> !visible(m.access) && !m.name.equals("<clinit>")
+                        && !(m.name.equals("<init>") && (m.access & Opcodes.ACC_PRIVATE) == 0));
+                for (MethodNode m : cn.methods) stubBody(m, cn.superName);
                 cn.innerClasses.removeIf(ic -> !keep.contains(ic.name));
                 cn.nestMembers = null;
                 cn.nestHostClass = null;
@@ -114,6 +124,73 @@ public class StubJar {
             }
         }
         System.out.println("kept " + keep.size() + " of " + classes.size() + " classes");
+    }
+
+    /** Constructors of every class, from the first pass. */
+    static final Map<String, List<MethodNode>> constructors = new HashMap<>();
+
+    /**
+     * Replaces a method's code: static initializers do nothing, everything else throws.
+     * Constructors first call a superclass constructor, as the JVM requires and as AGP's
+     * mockable-jar step expects.
+     */
+    static void stubBody(MethodNode m, String superName) {
+        if ((m.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0) return;
+        InsnList code = new InsnList();
+        int stack = 3;
+        if (m.name.equals("<clinit>")) {
+            code.add(new InsnNode(Opcodes.RETURN));
+        } else {
+            if (m.name.equals("<init>") && superName != null) {
+                String superInit = superConstructor(superName);
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                int size = 1;
+                for (Type arg : Type.getArgumentTypes(superInit)) {
+                    code.add(defaultValue(arg));
+                    size += arg.getSize();
+                }
+                code.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, superName, "<init>", superInit, false));
+                stack = Math.max(stack, size);
+            }
+            code.add(new TypeInsnNode(Opcodes.NEW, "java/lang/RuntimeException"));
+            code.add(new InsnNode(Opcodes.DUP));
+            code.add(new LdcInsnNode("Stub!"));
+            code.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/lang/RuntimeException", "<init>", "(Ljava/lang/String;)V", false));
+            code.add(new InsnNode(Opcodes.ATHROW));
+        }
+        m.instructions = code;
+        m.tryCatchBlocks.clear();
+        m.localVariables = null;
+        m.visibleLocalVariableAnnotations = null;
+        m.invisibleLocalVariableAnnotations = null;
+        m.visibleTypeAnnotations = null;
+        m.invisibleTypeAnnotations = null;
+        m.maxStack = stack;
+        int locals = (m.access & Opcodes.ACC_STATIC) != 0 ? 0 : 1;
+        for (Type arg : Type.getArgumentTypes(m.desc)) locals += arg.getSize();
+        m.maxLocals = locals;
+    }
+
+    /** A constructor of the superclass to call: a visible one with the fewest parameters. */
+    static String superConstructor(String superName) {
+        List<MethodNode> candidates = constructors.getOrDefault(superName, List.of());
+        return candidates.stream()
+                .filter(c -> (c.access & Opcodes.ACC_PRIVATE) == 0)
+                .sorted(Comparator.comparingInt((MethodNode c) -> visible(c.access) ? 0 : 1)
+                        .thenComparingInt(c -> Type.getArgumentTypes(c.desc).length))
+                .map(c -> c.desc)
+                .findFirst()
+                .orElse("()V");
+    }
+
+    static AbstractInsnNode defaultValue(Type type) {
+        switch (type.getSort()) {
+            case Type.LONG: return new InsnNode(Opcodes.LCONST_0);
+            case Type.FLOAT: return new InsnNode(Opcodes.FCONST_0);
+            case Type.DOUBLE: return new InsnNode(Opcodes.DCONST_0);
+            case Type.OBJECT: case Type.ARRAY: return new InsnNode(Opcodes.ACONST_NULL);
+            default: return new InsnNode(Opcodes.ICONST_0);
+        }
     }
 
     static boolean implementsParcelable(String name, Map<String, List<String>> hierarchy, Set<String> seen) {

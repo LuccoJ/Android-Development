@@ -40,7 +40,9 @@ AGP itself and the app's libraries come from Google Maven and Maven Central as i
 build; downloading those involves no click-through license.
 
 `tools/StubJar.java` reduces the framework and the JDK classes to their public and protected
-API, like Google's `android.jar`. It also keeps the non-public supertypes that compilers need.
+API, like Google's `android.jar`. It also keeps the non-public supertypes that compilers need,
+and replaces every method body with `throw new RuntimeException("Stub!")` (constructors first
+call a superclass constructor), which AGP's unit-test support relies on.
 
 `gradle/central-mirror.gradle` is installed as a Gradle init script. It fetches Maven Central
 through Google's public mirror, because Central rate-limits busy shared IPs (HTTP 429).
@@ -63,3 +65,7 @@ through Google's public mirror, because Central rate-limits busy shared IPs (HTT
 | App | compileSdk | AGP | Result |
 |---|---|---|---|
 | Gadgetbridge (Codeberg, Oct 2026) | 37 (`android-37.0`) | 9.4.1 | Debug APK builds |
+| [WakeBridge](https://github.com/LuccoJ/WakeBridge) | 37 | 9.4.1 | APK builds, lint and Robolectric unit tests pass |
+
+Robolectric unit tests download their own Android framework jars from Maven Central at run time;
+see WakeBridge's README for pointing them at a mirror.
